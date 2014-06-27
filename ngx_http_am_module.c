@@ -35,6 +35,10 @@ typedef struct{
     ngx_str_t conf_file;
 }ngx_http_am_main_conf_t;
 
+typedef struct {
+    unsigned waiting_more_body:1;
+} ngx_http_am_ctx_t;
+
 void *agent_config = NULL;
 boolean_t agent_initialized = B_FALSE;
 
@@ -92,7 +96,13 @@ ngx_module_t ngx_http_am_module = {
 
 static void
 ngx_http_am_read_body_handler(ngx_http_request_t *r){
-    ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_am_ctx_t *ctx;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_am_module);
+    if (ctx->waiting_more_body) {
+        ngx_http_core_run_phases(r);
+    } else {
+        ngx_http_finalize_request(r, NGX_DONE);
+    }
 }
 
 static am_status_t
@@ -105,8 +115,6 @@ ngx_http_am_get_post_data(void **args, char **rbuf){
     if(!*rbuf){
         return AM_FAILURE;
     }
-    int rc;
-    rc = ngx_http_read_client_request_body(r, ngx_http_am_read_body_handler);
     ngx_chain_t *bufs = r->request_body->bufs;
     int len;
     int pos = 0;
@@ -864,7 +872,7 @@ ngx_http_am_notification_handler(ngx_http_request_t *r)
 {
     ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
                   "notification request.");
-    ngx_http_read_client_request_body(r, ngx_http_am_read_body);
+    //ngx_http_read_client_request_body(r, ngx_http_am_read_body);
     return NGX_DONE;
 }
 
@@ -878,6 +886,7 @@ ngx_http_am_handler(ngx_http_request_t *r)
     ngx_int_t err = NGX_ERROR;
     int ret = NGX_HTTP_INTERNAL_SERVER_ERROR;
     void *args[2] = {r, &ret};
+    ngx_http_am_ctx_t *ctx;
 
     ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
                   "ngx_http_am_handler()");
@@ -885,6 +894,23 @@ ngx_http_am_handler(ngx_http_request_t *r)
     // internal request is permitted unconditionally
     if(r->internal){
         return NGX_DECLINED;
+    }
+
+    // Fetch request body before processing the request (only if POST for now)
+    ctx = ngx_http_get_module_ctx(r, ngx_http_am_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_am_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_am_module);
+    }
+    if (r->method == NGX_HTTP_POST && !ctx->waiting_more_body) {
+        int rc = ngx_http_read_client_request_body(r, ngx_http_am_read_body_handler);
+        if (rc == NGX_AGAIN) {
+            ctx->waiting_more_body = 1;
+            return rc;
+        }
     }
 
     if(agent_initialized == B_FALSE){
@@ -937,6 +963,10 @@ ngx_http_am_handler(ngx_http_request_t *r)
                       "am_web_process_request error. "
                       "status=%s(%d)", am_status_to_name(status), status);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (ctx->waiting_more_body) {
+        ngx_http_finalize_request(r, NGX_DONE);
     }
 
     ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
